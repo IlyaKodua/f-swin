@@ -20,7 +20,7 @@ from torchlibrosa.augmentation import SpecAugmentation
 
 from itertools import repeat
 from typing import List
-from layers import  Mlp, DropPath, trunc_normal_, to_2tuple
+from .layers import PatchEmbed, Mlp, DropPath, trunc_normal_, to_2tuple
 from utils import do_mixup, interpolate
 
 
@@ -36,8 +36,8 @@ def window_partition(x, window_size):
         windows: (num_windows*B, window_size, window_size, C)
     """
     B, H, W, C = x.shape
-    x = x.view(B, H // window_size[0], window_size[0], W // window_size[1], window_size[1], C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size[0], window_size[1], C)
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
 
@@ -51,8 +51,8 @@ def window_reverse(windows, window_size, H, W):
     Returns:
         x: (B, H, W, C)
     """
-    B = int(windows.shape[0] / (H * W / window_size[0] / window_size[1]))
-    x = windows.view(B, H // window_size[0], W // window_size[1], window_size[0], window_size[1], -1)
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
@@ -208,7 +208,7 @@ class SwinTransformerBlock(nn.Module):
                     img_mask[:, h, w, :] = cnt
                     cnt += 1
 
-            mask_windows = window_partition(img_mask, (self.window_size,self.window_size))  # nW, window_size, window_size, 1
+            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
             mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
             attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
             attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
@@ -237,7 +237,7 @@ class SwinTransformerBlock(nn.Module):
             shifted_x = x
 
         # partition windows
-        x_windows = window_partition(shifted_x, (self.window_size,self.window_size) )  # nW*B, window_size, window_size, C
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
@@ -245,7 +245,7 @@ class SwinTransformerBlock(nn.Module):
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows,(self.window_size,self.window_size), H, W)  # B H' W' C
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
 
         # reverse cyclic shift
         if self.shift_size > 0:
@@ -306,48 +306,6 @@ class PatchMerging(nn.Module):
 
     def extra_repr(self):
         return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
-
-
-class PatchMergingFreq(nn.Module):
-    r""" Patch Merging Layer.
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.reduction = nn.Linear(2 * dim, 1 * dim, bias=False)
-        self.norm = norm_layer(2 * dim)
-
-    def forward(self, x):
-        """
-        x: B, H*W, C
-        """
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
-
-        x = x.view(B, H, W, C)
-
-        x0 = x[:, 0::2, :, :]  # B H/2 W/2 C
-        x1 = x[:, 1::2, :, :]  # B H/2 W/2 C
-        x = torch.cat([x0, x1], -1)  # B H/2 W/2 4*C
-        x = x.view(B, -1, 2 * C)  # B H/2 W 2*C
-
-        x = self.norm(x)
-        x = self.reduction(x)
-
-        return x
-
-    def extra_repr(self):
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
 
 
 class BasicLayer(nn.Module):
@@ -416,38 +374,6 @@ class BasicLayer(nn.Module):
 
     def extra_repr(self):
         return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
-
-class PatchEmbed(nn.Module):
-    """ 2D Image to Patch Embedding
-    """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, norm_layer=None, flatten=True, patch_stride = 16):
-        super().__init__()
-        # img_size = to_2tuple(img_size)
-        # patch_size = to_2tuple(patch_size)
-        # patch_stride = to_2tuple(patch_stride)
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.patch_stride = patch_stride
-        self.grid_size = (img_size[0] // patch_stride[0], img_size[1] // patch_stride[1])
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-        self.flatten = flatten
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-        
-        padding = ((patch_size[0] - patch_stride[0]) // 2, (patch_size[1] - patch_stride[1]) // 2)
-
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_stride, padding=padding)
-        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x)
-        if self.flatten:
-            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
-        x = self.norm(x)
-        return x
 
 
 # The Core of HTSAT
@@ -904,41 +830,7 @@ class HTSAT_Swin_Transformer(nn.Module):
                         'clipwise_output': clipwise_output
                     }
             else: # this part is typically used, and most easy one
-                # x = self.reshape_wav2img(x)
+                x = self.reshape_wav2img(x)
                 output_dict = self.forward_features(x)
         # x = self.head(x)
         return output_dict
-
-
-
-
-if __name__ == "__main__":
-    class CN:
-        def __init__(self):
-
-            self.mel_bins = 128
-            self.window_size = 1024
-            self.hop_size = 512
-            self.sample_rate = 16000
-            self.fmin=5
-            self.fmax=8000
-            self.enable_tscam=False
-            self.enable_repeat_mode =False
-
-    config = CN()  
-    model = HTSAT_Swin_Transformer(spec_size = 256,
-                                patch_size= 4,
-                                patch_stride= (4, 4),
-                                in_chans = 1,
-                                num_classes = 527,
-                                embed_dim = 96,
-                                depths = [2, 2, 6, 2],
-                                num_heads = [4, 8, 16, 32],
-                                window_size= 8,
-                                mlp_ratio = 4,
-                                 qkv_bias=True, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-                 norm_layer=nn.LayerNorm, 
-                 ape=False, patch_norm=True,
-                 use_checkpoint=False, norm_before_mlp='ln', config = config)
-    print(model(torch.zeros(4,3*16000))["clipwise_output"].shape)
